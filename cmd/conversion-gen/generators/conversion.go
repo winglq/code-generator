@@ -117,6 +117,12 @@ func getPeerTypeFor(context *generator.Context, t *types.Type, potenialPeerPkgs 
 		if p.Has(t.Name.Name) {
 			return p.Type(t.Name.Name)
 		}
+		if p.Has(t.Name.Name + "Desc") {
+			return p.Type(t.Name.Name + "Desc")
+		}
+		if strings.HasSuffix(t.Name.Name, "Desc") && p.Has(strings.TrimRight(t.Name.Name, "Desc")) {
+			return p.Type(strings.TrimRight(t.Name.Name, "Desc"))
+		}
 	}
 	return nil
 }
@@ -452,8 +458,8 @@ func unwrapAlias(in *types.Type) *types.Type {
 }
 
 const (
-	runtimePackagePath    = "k8s.io/apimachinery/pkg/runtime"
-	conversionPackagePath = "k8s.io/apimachinery/pkg/conversion"
+	objectPackagePath     = "archeros.com/arflash/pkg/api/object"
+	conversionPackagePath = objectPackagePath
 )
 
 type noEquality struct{}
@@ -541,12 +547,14 @@ func (g *genConversion) convertibleOnlyWithinPackage(inType, outType *types.Type
 		klog.V(5).Infof("type %v requests no conversion generation, skipping", t)
 		return false
 	}
+
 	// TODO: Consider generating functions for other kinds too.
 	if t.Kind != types.Struct {
 		return false
 	}
 	// Also, filter out private types.
 	if namer.IsPrivateGoName(other.Name.Name) {
+
 		return false
 	}
 	return true
@@ -656,11 +664,7 @@ func (g *genConversion) Init(c *generator.Context, w io.Writer) error {
 		}
 	}
 	sw := generator.NewSnippetWriter(w, c, "$", "$")
-	sw.Do("func init() {\n", nil)
-	sw.Do("localSchemeBuilder.Register(RegisterConversions)\n", nil)
-	sw.Do("}\n", nil)
-
-	scheme := c.Universe.Type(types.Name{Package: runtimePackagePath, Name: "Scheme"})
+	scheme := c.Universe.Type(types.Name{Package: objectPackagePath, Name: "Scheme"})
 	schemePtr := &types.Type{
 		Kind: types.Pointer,
 		Elem: scheme,
@@ -845,6 +849,7 @@ func (g *genConversion) doMap(inType, outType *types.Type, sw *generator.Snippet
 		// TODO: Implement it when necessary.
 		sw.Do("for range *in {\n", nil)
 		sw.Do("// FIXME: Converting unassignable keys unsupported $.|raw$\n", inType.Key)
+		sw.Do("compileErrorOnMissingConversion()\n", nil)
 	}
 	sw.Do("}\n", nil)
 }
@@ -867,6 +872,28 @@ func (g *genConversion) doSlice(inType, outType *types.Type, sw *generator.Snipp
 				sw.Do("if err := $.|raw$(&(*in)[i], &(*out)[i], s); err != nil {\n", function)
 			} else if g.convertibleOnlyWithinPackage(inType.Elem, outType.Elem) {
 				sw.Do("if err := "+nameTmpl+"(&(*in)[i], &(*out)[i], s); err != nil {\n", argsFromType(inType.Elem, outType.Elem))
+			} else if outType.Elem.Kind == types.Pointer {
+				otp := outType.Elem.Elem
+				if g.convertibleOnlyWithinPackage(inType.Elem, otp) {
+					sw.Do("(*out)[i] = &$.outType|raw${}\n", generator.Args{"outType": otp})
+					sw.Do("if err := "+nameTmpl+"(&(*in)[i], (*out)[i], s); err != nil {\n", argsFromType(inType.Elem, outType.Elem.Elem))
+				} else {
+					args := argsFromType(inType.Elem, outType.Elem)
+					sw.Do("// FIXME: Provide conversion function to convert $.inType|raw$ to $.outType|raw$\n", args)
+					sw.Do("compileErrorOnMissingConversion()\n", nil)
+					conversionExists = false
+				}
+			} else if inType.Elem.Kind == types.Pointer {
+				itp := inType.Elem.Elem
+				if g.convertibleOnlyWithinPackage(itp, outType.Elem) {
+					sw.Do("if err := "+nameTmpl+"((*in)[i], &(*out)[i], s); err != nil {\n", argsFromType(itp, outType.Elem))
+				} else {
+					args := argsFromType(inType.Elem, outType.Elem)
+					sw.Do("// FIXME: Provide conversion function to convert $.inType|raw$ to $.outType|raw$\n", args)
+					sw.Do("compileErrorOnMissingConversion()\n", nil)
+					conversionExists = false
+				}
+
 			} else {
 				args := argsFromType(inType.Elem, outType.Elem)
 				sw.Do("// FIXME: Provide conversion function to convert $.inType|raw$ to $.outType|raw$\n", args)
@@ -953,10 +980,26 @@ func (g *genConversion) doStruct(inType, outType *types.Type, sw *generator.Snip
 
 		// If we can't auto-convert, punt before we emit any code.
 		if inMemberType.Kind != outMemberType.Kind {
+			if inMemberType.Kind == types.Builtin && outMemberType.Kind == types.Pointer && inMemberType.Name == outMemberType.Elem.Name {
+				sw.Do("out.$.name$ = &in.$.name$\n", args)
+				continue
+			} else if inMemberType.Kind == types.Pointer && outMemberType.Kind == types.Builtin && inMemberType.Elem.Name == outMemberType.Name {
+				sw.Do("out.$.name$ = *in.$.name$\n", args)
+				continue
+			}
 			sw.Do("// WARNING: in."+inMember.Name+" requires manual conversion: inconvertible types ("+
 				inMemberType.String()+" vs "+outMemberType.String()+")\n", nil)
 			g.skippedFields[inType] = append(g.skippedFields[inType], inMember.Name)
 			continue
+		}
+		// manually convert for map if key types are different
+		if inMemberType.Kind == types.Map && outMemberType.Kind == types.Map {
+			if !isDirectlyAssignable(inMemberType.Key, outMemberType.Key) {
+				sw.Do("// WARNING: in."+inMember.Name+" requires manual conversion: inconvertible types ("+
+					inMemberType.String()+" vs "+outMemberType.String()+")\n", nil)
+				g.skippedFields[inType] = append(g.skippedFields[inType], inMember.Name)
+				continue
+			}
 		}
 
 		switch inMemberType.Kind {
@@ -1214,7 +1257,12 @@ func isDirectlyAssignable(inType, outType *types.Type) bool {
 	// TODO: This should maybe check for actual assignability between the two
 	// types, rather than superficial traits that happen to indicate it is
 	// assignable in the ways we currently use this code.
-	return inType.IsAssignable() && (inType.IsPrimitive() || isSamePackage(inType, outType))
+	if inType.IsAssignable() && (inType.IsPrimitive() || isSamePackage(inType, outType)) {
+		if inType.Name == outType.Name {
+			return true
+		}
+	}
+	return false
 }
 
 func isSamePackage(inType, outType *types.Type) bool {
