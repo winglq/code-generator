@@ -944,7 +944,10 @@ func (g *genConversion) doStruct(inType, outType *types.Type, sw *generator.Snip
 		}
 
 		args := argsFromType(inMemberType, outMemberType).With("name", inMember.Name)
-
+		toRaw := true
+		if outMemberType.Name.Name == "[]int8" {
+			toRaw = false
+		}
 		// try a direct memory copy for any type that has exactly equivalent values
 		if g.useUnsafe.Equal(inMemberType, outMemberType) {
 			args = args.
@@ -958,7 +961,11 @@ func (g *genConversion) doStruct(inType, outType *types.Type, sw *generator.Snip
 				sw.Do("out.$.name$ = *(*$.outType|raw$)($.Pointer|raw$(&in.$.name$))\n", args)
 				continue
 			case types.Slice:
-				sw.Do("out.$.name$ = *(*$.outType|raw$)($.Pointer|raw$(&in.$.name$))\n", args)
+				if toRaw {
+					sw.Do("out.$.name$ = *(*$.outType|raw$)($.Pointer|raw$(&in.$.name$))\n", args)
+				} else {
+					sw.Do("out.$.name$ = *(*$.outType$)($.Pointer|raw$(&in.$.name$))\n", args)
+				}
 				continue
 			}
 		}
